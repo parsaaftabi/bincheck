@@ -130,7 +130,7 @@ The binary lands at `build/bincheck` (`build\Release\bincheck.exe` on Windows).
 bincheck <file>            # human readable report
 bincheck --json <file>     # JSON report for scripts
 bincheck --strict <file>   # exit 1 when any check fails
-bincheck --version         # print "bincheck 0.2.0"
+bincheck --version         # print "bincheck 0.2.1"
 ```
 
 The JSON report carries a top level `version` field with the bincheck version, so a script can pin the output shape it reads.

@@ -13,7 +13,7 @@
 namespace {
 
 #ifndef BINCHECK_VERSION
-#define BINCHECK_VERSION "0.2.0"
+#define BINCHECK_VERSION "0.2.1"
 #endif
 
 std::string hexNum(uint64_t value) {

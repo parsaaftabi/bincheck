@@ -88,6 +88,14 @@ def find_mingw_compiler32():
 
 
 def elf_fixture_tests(binary, work, fixture_src):
+    # The ELF fixtures need a host compiler that targets ELF. On a
+    # Windows host the available gcc targets PE and rejects the ELF
+    # linker flags (-z relro and friends), so these cases run on the
+    # Linux CI job only. The parser still gets exercised on Windows
+    # through the PE fixtures and the self tests.
+    if sys.platform.startswith("win"):
+        skip("elf fixtures", "host compiler targets PE on Windows")
+        return
     cc = find_host_compiler()
     if cc is None:
         skip("elf fixtures", "no host C compiler found")
@@ -120,7 +128,7 @@ def elf_fixture_tests(binary, work, fixture_src):
         record(False, "hardened fixture json parses", str(exc))
         return
     record(report.get("format") == "ELF", "json format is ELF")
-    record(report.get("version") == "0.2.0", "json version is 0.2.0")
+    record(report.get("version") == "0.2.1", "json version is 0.2.1")
     record(report.get("architecture") == "x86-64", "json architecture")
     record(check_status(report, "pie") == "pass", "json pie passes")
     record(check_status(report, "nx-stack") == "pass", "json nx-stack passes")
@@ -260,10 +268,13 @@ def pe_fixture_tests(binary, work, fixture_src):
     for name in ("aslr", "high-entropy-aslr", "dep-nx", "cfg"):
         record(check_status(report, name) in ("pass", "fail"),
                f"pe json reports {name}")
-    # The mingw linker writes a load config with a zero SecurityCookie
-    # field, so gs-cookie reads fail on this fixture. safe-seh is n/a
-    # on 64-bit files.
-    record(check_status(report, "gs-cookie") in ("pass", "fail"),
+    # The llvm-mingw linker writes a load config with a zero
+    # SecurityCookie field, so gs-cookie reads fail on that fixture.
+    # A mingw linker running on a Windows host may write no load
+    # config at all, and then the check reports n/a. Either way the
+    # check must be present with a valid status. safe-seh is n/a on
+    # 64-bit files.
+    record(check_status(report, "gs-cookie") in ("pass", "fail", "n/a"),
            "pe json reports gs-cookie")
     record(check_status(report, "safe-seh") == "n/a",
            "pe 64-bit safe-seh is n/a")
@@ -293,10 +304,10 @@ def pe_fixture_tests(binary, work, fixture_src):
                        "pe32 json format is PE")
                 record(report32.get("bits") == 32, "pe32 json bits is 32")
                 record(check_status(report32, "safe-seh")
-                       in ("pass", "fail"),
+                       in ("pass", "fail", "n/a"),
                        "pe32 json reports safe-seh")
                 record(check_status(report32, "gs-cookie")
-                       in ("pass", "fail"),
+                       in ("pass", "fail", "n/a"),
                        "pe32 json reports gs-cookie")
 
     with open(exe, "rb") as fh:
@@ -343,8 +354,8 @@ def malformed_tests(binary, work):
 
 def self_tests(binary):
     proc = run_bincheck(binary, "--version")
-    record(proc.returncode == 0 and proc.stdout.strip() == "bincheck 0.2.0",
-           "--version prints bincheck 0.2.0",
+    record(proc.returncode == 0 and proc.stdout.strip() == "bincheck 0.2.1",
+           "--version prints bincheck 0.2.1",
            f"exit {proc.returncode} out {proc.stdout.strip()!r}")
 
     proc = run_bincheck(binary, "--json", binary)

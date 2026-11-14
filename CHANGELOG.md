@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1, 2026-11-14
+
+Test script fixes for Windows hosts. The tool itself did not change.
+
+- The ELF fixture cases now skip on Windows. The host gcc there targets PE and its linker rejects the ELF `-z` options the fixtures build with. These cases run on the Linux CI job.
+- The PE gs-cookie and safe-seh cases accept n/a. A mingw linker running on a Windows host can write a PE file with no load config directory at all, where the llvm-mingw cross build writes one with a zero cookie field. Both are valid answers from the checks.
+- Caught by the first 0.2.0 CI run on windows-latest: 19 passed, 2 failed. The same run was green on ubuntu-latest.
+
 ## 0.2.0, 2026-11-14
 
 - ELF: new `fortify` check. It passes when a `*_chk` function such as `__memcpy_chk` or `__printf_chk` appears in the dynamic symbols. `__stack_chk_fail` does not count, it is the canary helper. A file with a dynamic symbol table and no fortified calls fails. A file with no dynamic symbol table reports n/a.
