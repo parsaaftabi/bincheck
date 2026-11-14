@@ -71,6 +71,22 @@ def find_mingw_compiler():
     return None
 
 
+def find_mingw_compiler32():
+    home = os.path.expanduser("~")
+    fixed = os.path.join(
+        home,
+        "workspace/tools/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64/bin",
+        "i686-w64-mingw32-g++",
+    )
+    if os.path.isfile(fixed) and os.access(fixed, os.X_OK):
+        return fixed
+    for cand in ("i686-w64-mingw32-g++", "i686-w64-mingw32-clang++"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return None
+
+
 def elf_fixture_tests(binary, work, fixture_src):
     cc = find_host_compiler()
     if cc is None:
@@ -104,6 +120,7 @@ def elf_fixture_tests(binary, work, fixture_src):
         record(False, "hardened fixture json parses", str(exc))
         return
     record(report.get("format") == "ELF", "json format is ELF")
+    record(report.get("version") == "0.2.0", "json version is 0.2.0")
     record(report.get("architecture") == "x86-64", "json architecture")
     record(check_status(report, "pie") == "pass", "json pie passes")
     record(check_status(report, "nx-stack") == "pass", "json nx-stack passes")
@@ -112,8 +129,78 @@ def elf_fixture_tests(binary, work, fixture_src):
            "json full-relro passes")
     record(check_status(report, "stack-canary") == "pass",
            "json stack-canary passes")
+    record(check_status(report, "rpath") == "n/a",
+           "hardened fixture rpath is n/a without an rpath tag")
     record(any("libc" in lib for lib in report.get("needed", [])),
            "json needed lists libc")
+
+    # Fortify: this gcc predefines _FORTIFY_SOURCE at -O2, so the pass
+    # build states it outright and the fail build undefines it. The fail
+    # build keeps the stack protector, so the canary check still passes
+    # and only fortify flips.
+    fortified = os.path.join(work, "fixture-fortified")
+    out = run([
+        cc, "-O2", "-D_FORTIFY_SOURCE=2", "-pie", "-fPIE",
+        "-fstack-protector-strong", fixture_src, "-o", fortified,
+    ])
+    if out.returncode != 0:
+        record(False, "build fortified fixture", out.stderr.strip())
+        return
+    record(True, "build fortified fixture")
+    proc = run_bincheck(binary, "--json", fortified)
+    try:
+        report = json.loads(proc.stdout)
+    except ValueError as exc:
+        record(False, "fortified fixture json parses", str(exc))
+        return
+    record(check_status(report, "fortify") == "pass",
+           "fortified fixture fortify passes")
+
+    unfortified = os.path.join(work, "fixture-unfortified")
+    out = run([
+        cc, "-O2", "-U_FORTIFY_SOURCE", "-pie", "-fPIE",
+        "-fstack-protector-strong", fixture_src, "-o", unfortified,
+    ])
+    if out.returncode != 0:
+        record(False, "build unfortified fixture", out.stderr.strip())
+        return
+    record(True, "build unfortified fixture")
+    proc = run_bincheck(binary, "--json", unfortified)
+    try:
+        report = json.loads(proc.stdout)
+    except ValueError as exc:
+        record(False, "unfortified fixture json parses", str(exc))
+        return
+    record(check_status(report, "fortify") == "fail",
+           "unfortified fixture fortify fails")
+    record(check_status(report, "stack-canary") == "pass",
+           "unfortified fixture canary still passes")
+
+    # RPATH: an absolute entry and a $ORIGIN entry pass, a plain
+    # relative entry fails.
+    for label, rpath, want in (
+        ("absolute", "/tmp/x", "pass"),
+        ("origin", "$ORIGIN/lib", "pass"),
+        ("relative", "lib", "fail"),
+    ):
+        target = os.path.join(work, f"fixture-rpath-{label}")
+        out = run([
+            cc, "-O2", "-pie", "-fPIE", fixture_src, "-o", target,
+            f"-Wl,-rpath,{rpath}",
+        ])
+        if out.returncode != 0:
+            record(False, f"build rpath {label} fixture",
+                   out.stderr.strip())
+            continue
+        record(True, f"build rpath {label} fixture")
+        proc = run_bincheck(binary, "--json", target)
+        try:
+            report = json.loads(proc.stdout)
+        except ValueError as exc:
+            record(False, f"rpath {label} fixture json parses", str(exc))
+            continue
+        record(check_status(report, "rpath") == want,
+               f"rpath {label} fixture reports {want}")
 
     weak = os.path.join(work, "fixture-weak")
     out = run([
@@ -173,10 +260,44 @@ def pe_fixture_tests(binary, work, fixture_src):
     for name in ("aslr", "high-entropy-aslr", "dep-nx", "cfg"):
         record(check_status(report, name) in ("pass", "fail"),
                f"pe json reports {name}")
+    # The mingw linker writes a load config with a zero SecurityCookie
+    # field, so gs-cookie reads fail on this fixture. safe-seh is n/a
+    # on 64-bit files.
+    record(check_status(report, "gs-cookie") in ("pass", "fail"),
+           "pe json reports gs-cookie")
+    record(check_status(report, "safe-seh") == "n/a",
+           "pe 64-bit safe-seh is n/a")
 
     proc = run_bincheck(binary, exe)
     record(proc.returncode == 0, "pe fixture exits 0",
            f"exit {proc.returncode}")
+
+    cxx32 = find_mingw_compiler32()
+    if cxx32 is None:
+        skip("pe32 fixture", "llvm-mingw 32-bit compiler not found")
+    else:
+        exe32 = os.path.join(work, "fixture-pe32.exe")
+        out = run([cxx32, "-static", fixture_src, "-o", exe32])
+        if out.returncode != 0:
+            record(False, "build pe32 fixture", out.stderr.strip())
+        else:
+            record(True, "build pe32 fixture")
+            proc = run_bincheck(binary, "--json", exe32)
+            try:
+                report32 = json.loads(proc.stdout)
+            except ValueError as exc:
+                record(False, "pe32 fixture json parses", str(exc))
+                report32 = None
+            if report32 is not None:
+                record(report32.get("format") == "PE",
+                       "pe32 json format is PE")
+                record(report32.get("bits") == 32, "pe32 json bits is 32")
+                record(check_status(report32, "safe-seh")
+                       in ("pass", "fail"),
+                       "pe32 json reports safe-seh")
+                record(check_status(report32, "gs-cookie")
+                       in ("pass", "fail"),
+                       "pe32 json reports gs-cookie")
 
     with open(exe, "rb") as fh:
         head = fh.read(32)
@@ -221,6 +342,11 @@ def malformed_tests(binary, work):
 
 
 def self_tests(binary):
+    proc = run_bincheck(binary, "--version")
+    record(proc.returncode == 0 and proc.stdout.strip() == "bincheck 0.2.0",
+           "--version prints bincheck 0.2.0",
+           f"exit {proc.returncode} out {proc.stdout.strip()!r}")
+
     proc = run_bincheck(binary, "--json", binary)
     try:
         report = json.loads(proc.stdout)

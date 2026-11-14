@@ -12,6 +12,10 @@
 
 namespace {
 
+#ifndef BINCHECK_VERSION
+#define BINCHECK_VERSION "0.2.0"
+#endif
+
 std::string hexNum(uint64_t value) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "0x%llx",
@@ -50,6 +54,7 @@ std::string jsonEscape(const std::string& text) {
 
 void printJson(const Report& rep) {
     std::cout << "{\n";
+    std::cout << "  \"version\": \"" << BINCHECK_VERSION << "\",\n";
     std::cout << "  \"file\": \"" << jsonEscape(rep.file) << "\",\n";
     std::cout << "  \"format\": \"" << rep.format << "\",\n";
     std::cout << "  \"bits\": " << rep.bits << ",\n";
@@ -169,7 +174,7 @@ void printHuman(const Report& rep) {
 }
 
 void printUsage() {
-    std::cerr << "usage: bincheck [--json] [--strict] <file>\n";
+    std::cerr << "usage: bincheck [--json] [--strict] [--version] <file>\n";
 }
 
 } // namespace
@@ -182,6 +187,9 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--json") {
             json = true;
+        } else if (arg == "--version") {
+            std::cout << "bincheck " << BINCHECK_VERSION << "\n";
+            return 0;
         } else if (arg == "--strict") {
             strict = true;
         } else if (arg == "--help" || arg == "-h") {

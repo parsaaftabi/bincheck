@@ -35,7 +35,9 @@ constexpr int64_t kDtNull = 0;
 constexpr int64_t kDtNeeded = 1;
 constexpr int64_t kDtStrTab = 5;
 constexpr int64_t kDtStrSz = 10;
+constexpr int64_t kDtRpath = 15;
 constexpr int64_t kDtBindNow = 24;
+constexpr int64_t kDtRunpath = 29;
 constexpr int64_t kDtFlags = 30;
 constexpr int64_t kDtFlags1 = 0x6ffffffb;
 constexpr uint64_t kDfBindNow = 0x8;
@@ -122,6 +124,19 @@ struct DynamicEntry {
     int64_t tag = 0;
     uint64_t value = 0;
 };
+
+// A fortified libc call ends in _chk (__memcpy_chk, __printf_chk and so
+// on). The stack canary helper __stack_chk_fail does not count. It guards
+// the stack, it is not a fortified call.
+bool isFortifiedName(const std::string& name) {
+    if (name == "__stack_chk_fail" || name == "__stack_chk_guard") {
+        return false;
+    }
+    const std::string suffix = "_chk";
+    return name.size() > suffix.size() &&
+           name.compare(name.size() - suffix.size(), suffix.size(), suffix) ==
+               0;
+}
 
 } // namespace
 
@@ -343,6 +358,10 @@ Report parseElf(const Reader& r, const std::string& fileName) {
     uint64_t strTabSize = 0;
     bool bindNow = false;
     std::vector<uint64_t> neededOffsets;
+    bool haveRpath = false;
+    bool haveRunpath = false;
+    uint64_t rpathOffset = 0;
+    uint64_t runpathOffset = 0;
     for (const DynamicEntry& entry : dynamic) {
         if (entry.tag == kDtNeeded) {
             neededOffsets.push_back(entry.value);
@@ -350,6 +369,12 @@ Report parseElf(const Reader& r, const std::string& fileName) {
             strTabAddr = entry.value;
         } else if (entry.tag == kDtStrSz) {
             strTabSize = entry.value;
+        } else if (entry.tag == kDtRpath) {
+            haveRpath = true;
+            rpathOffset = entry.value;
+        } else if (entry.tag == kDtRunpath) {
+            haveRunpath = true;
+            runpathOffset = entry.value;
         } else if (entry.tag == kDtBindNow) {
             bindNow = true;
         } else if (entry.tag == kDtFlags && (entry.value & kDfBindNow)) {
@@ -371,9 +396,13 @@ Report parseElf(const Reader& r, const std::string& fileName) {
         throw ParseError("virtual address has no file mapping");
     };
 
-    if (!neededOffsets.empty()) {
-        uint64_t strTabOff = 0;
-        bool haveStrTab = false;
+    // The dynamic string table backs DT_NEEDED, DT_RPATH and DT_RUNPATH.
+    // Resolve it once when any of those tags is present.
+    uint64_t strTabOff = 0;
+    bool haveStrTab = false;
+    std::string rpathValue;
+    std::string runpathValue;
+    if (!neededOffsets.empty() || haveRpath || haveRunpath) {
         if (strTabAddr != 0) {
             strTabOff = vaddrToOffset(strTabAddr);
             haveStrTab = true;
@@ -389,18 +418,30 @@ Report parseElf(const Reader& r, const std::string& fileName) {
                 }
             }
         }
-        if (!haveStrTab) {
+        if (!haveStrTab && !neededOffsets.empty()) {
             throw ParseError("dynamic string table not found");
         }
-        const uint64_t limit = strTabSize != 0 ? strTabOff + strTabSize : r.size();
-        for (uint64_t nameOff : neededOffsets) {
-            rep.libraries.push_back(r.cstr(strTabOff + nameOff, limit));
+        if (haveStrTab) {
+            const uint64_t limit =
+                strTabSize != 0 ? strTabOff + strTabSize : r.size();
+            for (uint64_t nameOff : neededOffsets) {
+                rep.libraries.push_back(r.cstr(strTabOff + nameOff, limit));
+            }
+            if (haveRpath) {
+                rpathValue = r.cstr(strTabOff + rpathOffset, limit);
+            }
+            if (haveRunpath) {
+                runpathValue = r.cstr(strTabOff + runpathOffset, limit);
+            }
         }
     }
 
     // Stack canary: __stack_chk_fail must appear in the dynamic symbols.
+    // The same scan collects fortified *_chk calls for the fortify check.
     bool haveDynSym = false;
     bool canary = false;
+    bool fortified = false;
+    std::string firstFortified;
     for (const Section& sec : sections) {
         if (sec.type != kShtDynSym) {
             continue;
@@ -428,10 +469,13 @@ Report parseElf(const Reader& r, const std::string& fileName) {
                 r.cstr(strs.offset + nameOff, strs.offset + strs.size);
             if (name == "__stack_chk_fail") {
                 canary = true;
-                break;
+            }
+            if (!fortified && isFortifiedName(name)) {
+                fortified = true;
+                firstFortified = name;
             }
         }
-        if (canary) {
+        if (canary && fortified) {
             break;
         }
     }
@@ -517,6 +561,87 @@ Report parseElf(const Reader& r, const std::string& fileName) {
         canaryCheck.detail = "__stack_chk_fail not in dynamic symbols";
     }
     rep.checks.push_back(canaryCheck);
+
+    Check fortify;
+    fortify.name = "fortify";
+    if (!haveDynSym) {
+        fortify.status = "n/a";
+        fortify.detail = "no dynamic symbol table";
+    } else if (fortified) {
+        fortify.status = "pass";
+        fortify.detail =
+            "fortified calls in dynamic symbols, e.g. " + firstFortified;
+    } else {
+        fortify.status = "fail";
+        fortify.detail = "no *_chk functions in dynamic symbols";
+    }
+    rep.checks.push_back(fortify);
+
+    // RPATH and RUNPATH entries are split on ':'. An entry is safe when
+    // it is absolute or starts with $ORIGIN. An empty entry puts the
+    // current directory on the search path. A plain relative entry
+    // depends on the caller's working directory. Both fail.
+    Check rpath;
+    rpath.name = "rpath";
+    if (!haveRpath && !haveRunpath) {
+        rpath.status = "n/a";
+        rpath.detail = "no DT_RPATH or DT_RUNPATH entry";
+    } else if (!haveStrTab) {
+        rpath.status = "n/a";
+        rpath.detail = "dynamic string table not found, value unread";
+    } else {
+        std::string badEntry;
+        std::string badTag;
+        bool foundBad = false;
+        std::string shown;
+        auto judge = [&](const char* tag, const std::string& value) {
+            if (!shown.empty()) {
+                shown += "; ";
+            }
+            shown += tag;
+            shown += " '";
+            shown += value;
+            shown += "'";
+            size_t start = 0;
+            while (!foundBad) {
+                const size_t colon = value.find(':', start);
+                const std::string entry = value.substr(
+                    start, colon == std::string::npos ? colon : colon - start);
+                const bool origin = entry.rfind("$ORIGIN", 0) == 0 ||
+                                    entry.rfind("${ORIGIN}", 0) == 0;
+                if (entry.empty() || (!origin && entry[0] != '/')) {
+                    badEntry = entry;
+                    badTag = tag;
+                    foundBad = true;
+                }
+                if (colon == std::string::npos) {
+                    break;
+                }
+                start = colon + 1;
+            }
+        };
+        if (haveRpath) {
+            judge("DT_RPATH", rpathValue);
+        }
+        if (haveRunpath) {
+            judge("DT_RUNPATH", runpathValue);
+        }
+        if (foundBad) {
+            rpath.status = "fail";
+            if (badEntry.empty()) {
+                rpath.detail =
+                    badTag + " contains an empty entry, the loader searches "
+                             "the current directory";
+            } else {
+                rpath.detail = badTag + " entry '" + badEntry +
+                               "' is relative and has no $ORIGIN";
+            }
+        } else {
+            rpath.status = "pass";
+            rpath.detail = shown;
+        }
+    }
+    rep.checks.push_back(rpath);
 
     return rep;
 }

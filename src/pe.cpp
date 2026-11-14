@@ -177,9 +177,71 @@ Report parsePe(const Reader& r, const std::string& fileName) {
     uint32_t loadConfigSize = 0;
     directory(kDirLoadConfig, loadConfigRva, loadConfigSize);
     rep.hasLoadConfig = loadConfigRva != 0 && loadConfigSize != 0;
+
+    // Load config fields read for the gs-cookie and safe-seh checks.
+    // Offsets come from IMAGE_LOAD_CONFIG_DIRECTORY32/64 in winnt.h,
+    // verified against the mingw headers on this machine. The task
+    // brief wrote the PE32 SecurityCookie offset as 0x60 and the PE32+
+    // one as 0x88. Those are the decimal offsets 60 and 88. In hex the
+    // field sits at 0x3c in the 32-bit struct and 0x58 in the 64-bit
+    // struct.
+    //   PE32:  SecurityCookie 0x3c (4 bytes), SEHandlerTable 0x40,
+    //          SEHandlerCount 0x44, GuardFlags 0x58
+    //   PE32+: SecurityCookie 0x58 (8 bytes), SEHandlerTable 0x60,
+    //          SEHandlerCount 0x68, GuardFlags 0x90
+    // A field is read only when the directory covers it. The usable
+    // size is the smaller of the directory size and the struct Size
+    // field, and the read must also fit inside the file.
+    uint64_t securityCookie = 0;
+    bool haveCookieField = false;
+    uint64_t sehTable = 0;
+    uint64_t sehCount = 0;
+    bool haveSehFields = false;
+    uint32_t guardFlags = 0;
+    bool haveGuardFlags = false;
     if (rep.hasLoadConfig) {
         // Touch the offset so a bogus directory is reported, not hidden.
-        (void)rvaToOffset(loadConfigRva);
+        const uint64_t lcOff = rvaToOffset(loadConfigRva);
+        uint64_t usable = loadConfigSize;
+        if (lcOff + 4 <= r.size()) {
+            const uint32_t structSize = r.u32(lcOff);
+            if (structSize != 0 && structSize < usable) {
+                usable = structSize;
+            }
+        }
+        auto fieldFits = [&](uint64_t fieldOff, uint64_t fieldLen) {
+            return fieldOff + fieldLen <= usable &&
+                   lcOff + fieldOff + fieldLen <= r.size();
+        };
+        if (is64) {
+            if (fieldFits(0x58, 8)) {
+                securityCookie = r.u64(lcOff + 0x58);
+                haveCookieField = true;
+            }
+            if (fieldFits(0x60, 8) && fieldFits(0x68, 8)) {
+                sehTable = r.u64(lcOff + 0x60);
+                sehCount = r.u64(lcOff + 0x68);
+                haveSehFields = true;
+            }
+            if (fieldFits(0x90, 4)) {
+                guardFlags = r.u32(lcOff + 0x90);
+                haveGuardFlags = true;
+            }
+        } else {
+            if (fieldFits(0x3c, 4)) {
+                securityCookie = r.u32(lcOff + 0x3c);
+                haveCookieField = true;
+            }
+            if (fieldFits(0x40, 4) && fieldFits(0x44, 4)) {
+                sehTable = r.u32(lcOff + 0x40);
+                sehCount = r.u32(lcOff + 0x44);
+                haveSehFields = true;
+            }
+            if (fieldFits(0x58, 4)) {
+                guardFlags = r.u32(lcOff + 0x58);
+                haveGuardFlags = true;
+            }
+        }
     }
 
     auto addCheck = [&](const char* name, uint16_t flag, const char* onText,
@@ -208,6 +270,48 @@ Report parsePe(const Reader& r, const std::string& fileName) {
     addCheck("cfg", kDllGuardCf,
              "GUARD_CF set, Control Flow Guard metadata is present",
              "GUARD_CF clear, no Control Flow Guard");
+
+    Check gs;
+    gs.name = "gs-cookie";
+    if (!rep.hasLoadConfig) {
+        gs.status = "n/a";
+        gs.detail = "no load config directory";
+    } else if (!haveCookieField) {
+        gs.status = "n/a";
+        gs.detail = "load config too small to hold the SecurityCookie field";
+    } else if (securityCookie != 0) {
+        gs.status = "pass";
+        gs.detail = "load config SecurityCookie is set";
+    } else {
+        gs.status = "fail";
+        gs.detail = "load config SecurityCookie is zero";
+    }
+    rep.checks.push_back(gs);
+
+    Check seh;
+    seh.name = "safe-seh";
+    if (is64) {
+        seh.status = "n/a";
+        seh.detail =
+            "64-bit PE reads handlers from .pdata, no SEHandlerTable";
+    } else if (!rep.hasLoadConfig) {
+        seh.status = "n/a";
+        seh.detail = "no load config directory";
+    } else if (!haveSehFields && !haveGuardFlags) {
+        seh.status = "n/a";
+        seh.detail = "load config too small to hold the SE handler fields";
+    } else if (haveSehFields && sehTable != 0 && sehCount != 0) {
+        seh.status = "pass";
+        seh.detail = "SEHandlerTable present with " +
+                     std::to_string(sehCount) + " handlers";
+    } else if (haveGuardFlags && guardFlags != 0) {
+        seh.status = "pass";
+        seh.detail = "GuardFlags set in load config";
+    } else {
+        seh.status = "fail";
+        seh.detail = "SEHandlerTable empty and GuardFlags clear";
+    }
+    rep.checks.push_back(seh);
 
     return rep;
 }

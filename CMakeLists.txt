@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(bincheck VERSION 0.1.0 LANGUAGES CXX)
+project(bincheck VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,8 @@ add_executable(bincheck
 )
 
 target_include_directories(bincheck PRIVATE src)
+target_compile_definitions(bincheck PRIVATE
+  BINCHECK_VERSION="${PROJECT_VERSION}")
 
 if(MSVC)
   target_compile_options(bincheck PRIVATE /W4)
